@@ -1,0 +1,293 @@
+---
+title: "Ridit_Analysis"
+output: html_document
+date: "2023-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+news_outlets <- c('People\'s Daily', 'China Youth Daily', 'Southern Meropolis Daily', 'Xinmin Evening', 'Chengdu Economic Daily', 'Ming Pao Daily', 'Apple Daily', 'Ta Kung Pao')
+regions <- c('mainland china', 'hk')
+alpha = 0.05
+```
+
+```{r}
+# function that takes in a df, reference group, and significance level, gets the mean ridit for each group and performs k-w test for testing if all rhois = P(Y < Xi) are equal and also constructs the confidence intervals for each rhoi
+# Arguments:
+# O: Dataframe containing the comparison groups
+# ref_group: vector containing the reference group
+# group_labels: labels for the comparison groups
+# plot title
+ridit4993 <- function(O, ref_group, group_labels, alpha, plot_title = "") {
+  nr = nrow(O)
+  
+  # Odotj contains the pooled responses from all the groups, for each of the category or scale, i.e. the reference set
+  Odotj <- ref_group
+  # Oidot contains the total number of response from each group 
+  Oidot <- apply(O, 1, sum)
+  
+  H <- 0.5 * Odotj
+  
+  # take the cumulative sum, i.e. each entry of C is the number of observations less than the current scale
+  cumsum1 <- cumsum(Odotj)
+  C <- c(0, cumsum1[1:(length(Odotj) - 1)])
+  
+  # P(Y < X = W)
+  N <- H + C
+  
+  # F_Rj, the estimated cumulative probability for each category (based on the reference group)
+  Rj <- N/sum(O)
+  
+  R <- matrix(0, nrow(O), ncol(O))
+  Odotdot <- sum(O)
+  
+  for (i in 1:nrow(O)) {
+    for (j in 1:ncol(O)) {
+      # obtain the ridits for each group and category 
+      R[i, j] <- O[i, j] / (Oidot[i]) * Rj[j]
+    }
+  }
+  
+  # mean ridit score of each group, i.e. estimate of P(Y<Xi)
+  Ri <- apply(R, 1, sum)
+  
+  # construct confidence interval for each rhoi
+  confidence <- cbind(Ri - qnorm(1-alpha/2)/sqrt(12 * Oidot), 
+                     Ri + qnorm(1-alpha/2)/sqrt(12 * Oidot))
+  
+  # plot confidence intervals for rhoi, forall i
+  gfg <- data.frame(
+    groups = 1:nr,
+    mean_ridit = Ri,
+    low = confidence[, 1],
+    up = confidence[, 2]
+  )
+  
+  # plot(c(1, 1), confidence[1,], xlim = c(1, dim(O)[1]), ylim = c(0, 1), col = 1, type = 'l', xlab='group', ylab='R score')
+  # segments(1:(dim(O)[1]), confidence[, 1], 1:(dim(O)[1]), confidence[, 2])
+  # abline(h = 0.5)
+  pl <- ggplot(gfg, aes(groups, mean_ridit, color = group_labels)) + geom_point() +  geom_errorbar(aes(ymin = low, ymax = up))
+  pl <- pl + ggtitle(plot_title)
+  
+  
+  # perform hypothesis test
+  # H0: foralli, rhoi = 0.5
+  # Ha: Otherwise
+  W <- 12 * t(Oidot) %*% (Ri - 0.5) ^ 2
+  pvalue  <- 1 - pchisq(W, nr - 1)
+  
+  return(list(W=W, p.value=pvalue, c.i=confidence, mean_ridit=Ri, pl=pl))
+}
+
+apply_ridit <- function(china_df, hk_df, plot_title) {
+  # apply ridit by treating each news outlet as a comparison group
+  print('News Outlets')
+  df <- rbind(china_df, hk_df)
+  print(ridit4993(df, colSums(df), news_outlets, alpha, paste(plot_title, " (News Outlets)")))
+  
+  # apply ridit with 2 comparison groups, china and hk
+  print('Regions')
+  china_pooled <- colSums(china_df)
+  hk_pooled <- colSums(hk_df)
+  print(ridit4993(rbind(china_pooled, hk_pooled), colSums(df), regions, alpha, paste(plot_title, " (Regions)")))
+}
+```
+
+Presence Of Different Sources And Points Of View
+```{r}
+q1_china <- data.frame(o1 = c(0, 20, 8, 4, 3), 
+                       o2 = c(1, 12, 2, 0, 1), 
+                       o3 = c(4, 0, 1, 1, 0), 
+                       o4 = c(38, 1, 2, 5, 2), 
+                       o5 = c(38, 0, 17, 6, 13))
+q1_hk <- data.frame(o1 = rep(0, 3), 
+                    o2 = rep(0, 3), 
+                    o3 = c(0, 2, 0), 
+                    o4 = c(4, 3, 4), 
+                    o5 = c(2, 1, 13))
+apply_ridit(q1_china, q1_hk, "Presence of Different Sources and Points of View")
+```
+
+Usage of hard facts and verifiable data
+```{r}
+q2_china <- data.frame(
+  o1 = c(0, 24, 9, 4, 4),
+  o2 = c(0, 8, 1, 0, 0), 
+  o3 = c(0, 0, 0, 1, 0), 
+  o4 = c(13, 0, 2, 2, 1),
+  o5 = c(68, 1, 18, 9, 14)
+)
+
+q2_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2 = rep(0, 3),
+  o3 = rep(0, 3),
+  o4 = c(1, 2, 0),
+  o5 = c(5, 4, 17)
+)
+apply_ridit(q2_china, q2_hk, "Usage of Hard Facts and Verifiable Data")
+```
+
+Quotes from sources
+```{r}
+q3_china <- data.frame(
+  o1 = c(0, 11, 2, 0, 1),
+  o2 = c(2, 20, 7, 4, 3),
+  o3 = c(13, 0, 6, 2, 3),
+  o4 = c(38, 2, 11, 7, 6),
+  o5 = c(28, 0, 4, 3, 6)
+)
+
+q3_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2 = rep(0, 3),
+  o3 = c(2, 0, 2),
+  o4 = c(2, 5, 8),
+  o5 = c(2, 1, 7)
+)
+apply_ridit(q3_china, q3_hk, "Quotes from Sources")
+```
+
+Facts First Before Opinion
+```{r}
+q4_china <- data.frame(
+  o1 = c(0, 14, 3, 1, 3),
+  o2 = c(2, 12, 8, 1, 2),
+  o3 = c(11, 2, 4, 4, 2),
+  o4 = c(40, 2, 11, 6, 5),
+  o5 = c(28, 3, 4, 4, 7)
+)
+
+q4_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2 = c(0, 0, 1),
+  o3 = c(0, 1, 2),
+  o4 = c(3, 4, 7),
+  o5 = c(3, 1, 7)
+)
+apply_ridit(q4_china, q4_hk, "Starting A Story With Facts First Before Opinion")
+```
+
+Usage or reasoning or logic
+```{r}
+q5_china <- data.frame(
+  o1 = c(0, 13, 2, 0, 2),
+  o2 = c(3, 9, 6, 0, 2),
+  o3 = c(14, 8, 10, 4, 5),
+  o4 = c(39, 2, 10, 11, 3),
+  o5 = c(25, 1, 2, 1, 7)
+)
+
+q5_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2= c(2, 1, 1),
+  o3 = c(1, 0, 3),
+  o4 = c(1, 4, 7),
+  o5 = c(2, 1, 6)
+)
+apply_ridit(q5_china, q5_hk, "Using Of Reasoning Or Logic Within The News Item To Prove Or Show A Proposal")
+```
+
+Usage of conditional expressions
+```{r}
+q6_china <- data.frame(
+  o1 = c(0, 10, 5, 0, 1),
+  o2 = c(6, 14, 4, 1, 3),
+  o3 = c(13, 7, 6, 6, 3),
+  o4 = c(41, 0, 10, 5, 5),
+  o5 = c(21, 2, 5, 4, 7)
+)
+
+q6_hk <- data.frame(
+  o1 = c(1, 1, 0),
+  o2 = c(2, 1, 0),
+  o3 = c(2, 4, 4),
+  o4 = c(0, 0, 7),
+  o5 = c(1, 0, 6)
+)
+apply_ridit(q6_china, q6_hk, "Using Conditional Expressions")
+```
+
+Freedom of topics covered
+```{r}
+q7_china <- data.frame(
+  o1 = c(0, 1, 0, 0, 0),
+  o2 = c(10, 17, 7, 2, 6),
+  o3 = c(36, 15, 17, 6, 11),
+  o4 = c(30, 0, 5, 5, 2),
+  o5 = c(5, 0, 1, 3, 0)
+)
+
+q7_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2 = c(0, 2, 0),
+  o3 = c(2, 1, 4),
+  o4 = c(4, 2, 12),
+  o5 = c(0, 1, 1)
+)
+apply_ridit(q7_china, q7_hk, "When I Have A Good Idea About A Topic That I Consider Important, I Always Get It Covered")
+```
+
+Freedom of which aspects of a story to emphasize
+```{r}
+q8_china <- data.frame(
+  o1 = c(2, 2, 1, 0, 3),
+  o2 = c(17, 14, 4, 1, 6),
+  o3 = c(31, 16, 16, 3, 5),
+  o4 = c(30, 1, 7, 11, 5),
+  o5 = c(1, 0, 2, 1, 0)
+)
+
+q8_hk <- data.frame(
+  o1 = c(0, 0, 1),
+  o2 = c(0, 1, 0),
+  o3 = c(2, 2, 7),
+  o4 = c(3, 3, 8),
+  o5 = c(1, 0, 1)
+)
+apply_ridit(q8_china, q8_hk, "I Have Quite Or A Lot Of Freedom To Decide Which Aspects Of A News/Story I Should Emphasize")
+```
+
+Freedom of news selection
+```{r}
+q9_china <- data.frame(
+  o1 = c(6, 2, 0, 0, 4),
+  o2 = c(17, 10, 4, 1, 6),
+  o3 = c(32, 20, 20, 6, 5),
+  o4 = c(25, 1, 5, 9, 4),
+  o5 = c(1, 0, 1, 0, 0)
+)
+
+q9_hk <- data.frame(
+  o1 = c(0, 1, 1),
+  o2 = c(0, 1, 1),
+  o3 = c(3, 1, 7),
+  o4 = c(3, 2, 7),
+  o5 = c(0, 1, 1)
+)
+apply_ridit(q9_china, q9_hk, "I Have Quite Or A Lot Of Freedom To Select The News/Stories On Which I Will Work On")
+```
+
+Work tends to be edited by others
+```{r}
+q10_china <- data.frame(
+  o1 = c(10, 4, 2, 1, 2),
+  o2 = c(39, 22, 6, 2, 5),
+  o3 = c(22, 3, 12, 4, 6),
+  o4 = c(6, 3, 9, 7, 2),
+  o5 = c(3, 1, 1, 2, 4)
+)
+
+q10_hk <- data.frame(
+  o1 = rep(0, 3),
+  o2 = c(0, 0, 1),
+  o3 = c(3, 4, 4),
+  o4 = c(3, 1, 8),
+  o5 = c(0, 1, 4)
+)
+apply_ridit(q10_china, q10_hk, "My Work Does Not Tend To Be Edited By Others")
+```

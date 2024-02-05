@@ -1,0 +1,526 @@
+---
+title: "classfication"
+output: html_document
+date: "2023-12-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# load required packages
+library(adabag)
+library(nnet)
+library(car)
+library(ResourceSelection)
+library(bestglm)
+library(caTools)
+library(LiblineaR)
+library(e1071)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(ipred)
+library(randomForest)
+```
+
+Helper Functions
+```{r}
+# encodes all categorical columns into integer types
+# usage: encode_to_numeric(df), where df is a dataframe
+# returns a dataframe with all categorical variables converted to integer, if any
+encode_to_numeric <- function(Z) {
+  col_types = sapply(Z, class)
+  categorical_var_indices <- which(col_types == 'character')
+  
+  for (idx in categorical_var_indices){
+    if (colnames(Z)[idx] == 'ChestPainType') {
+      Z[which(Z[, idx] == 'ASY'), idx] = 0
+      Z[which(Z[, idx] == 'NAP'), idx] = 1
+      Z[which(Z[, idx] == 'ATA'), idx] = 2
+      Z[which(Z[, idx] == 'TA'), idx] = 3
+    }
+    Z[, idx] <- unclass(as.factor(Z[, idx])) - 1
+    Z[, idx] <- as.integer(Z[, idx])
+  }
+
+  return(Z)  
+}
+
+
+## Selection Methods
+best_subset_aic <- function(X, y) {
+  # Best Subset Selection
+  model <- bestglm (cbind(X, y), IC = 'AIC', family = binomial)$BestModel
+  return(model)
+}
+
+best_subset_bic <- function(X, y) {
+  model <- bestglm(cbind(X, y), IC = 'BIC', family = binomial)$BestModel
+  return(model)
+}
+
+forward_aic <- function(X, y) {
+  biggest <- formula(glm(y~., data = cbind(X,  y), family = binomial))
+  
+  fit0 = glm(y~1, data = cbind(X, y), family = 'binomial')
+  fitfwd = step(fit0, direction = 'forward', scope = biggest)
+  
+  return(fitfwd)
+}
+
+backward_aic <- function(X, y) {
+  fit_full <- glm(y~., data = cbind(X, y), family = binomial)
+  fitB <- step(fit_full, direction = 'backward')
+  
+  return(fitB)
+}
+
+stepwise_aic <- function(X, y) {
+  biggest <- formula(glm(y~., data = cbind(X, y), family = binomial))
+  
+  fit0 = glm(y~1, data = cbind(X, y), family = 'binomial')
+  fitstep = step(fit0, direction = 'both', scope = biggest) 
+  return(fitstep)
+}
+############################################################################################################
+
+# Takes a design matrix X and a response label vector y
+# returns:
+# train_X: Training Data (X) (df)
+# train_y: Training labels (y) (df)
+# test_X: Test Data (X) (df)
+# test_y: Test Labels (y) (df)
+split_data <- function(X, y, split_ratio = 3/4) {
+  
+  # creates a mask of boolean values, where observations with true values representing train data and false values representing test data
+  mask <- sample.split(c(y[, 1]), SplitRatio = split_ratio)
+  
+  train_X <- subset(X, mask == T)
+  train_y <- subset(y, mask == T)
+  
+  test_X <- subset(X, mask == F)
+  test_y <- subset(y, mask == F)
+  
+  
+  test_X <- scale(test_X, center = colMeans(train_X), scale = apply(train_X, 2, sd))
+  train_X <- scale(train_X)
+  
+  return(list('train_X'=train_X, 'train_y'=train_y, 'test_X'=test_X, 'test_y'=test_y))
+}
+
+lr_fit <- function(lr_model) {
+  residual_dev <- summary(lr_model)$deviance
+  null_dev <- summary(lr_model)$null.deviance
+  # check overall fit 
+  r.squared <- 1 - residual_dev / null_dev
+  print(r.squared)
+  print("R squared:")
+  print(r.squared)
+  
+  # Test overall fit
+  g_stat <- null_dev - residual_dev
+  p.value <- pchisq(g_stat, df = ncol(lr_model$data), lower.tail = FALSE)
+  print("p-value for overall fit:")
+  print(p.value)
+  
+  # HL Test
+  hoslem.test(lr_model$y, fitted(lr_model))
+}
+
+get_probs <- function(model, test_X) {
+  # get the probs
+  if (class(model)[1] == 'glm'){
+    probs <- predict(model, as.data.frame(test_X), type = 'response')
+  }
+  else if (class(model)[1] == 'LiblineaR') {
+    probs <- predict(model, as.matrix(test_X), proba = T)$probabilities[, 1]
+  }
+  else if (class(model)[1] %in% c('rpart', 'classbagg', 'randomForest.formula')) {
+    probs <- predict(model, data.frame(test_X), type = 'prob')[, 2]
+  }
+  else if (class(model)[1] == 'boosting') {
+    probs <- predict(model, data.frame(test_X))$prob[, 2]
+  }
+  else {
+    stop('model type not supported')
+  }
+  
+  return(probs)
+}
+
+get_preds <- function(model, test_X, threshold = 0.5) {
+  # svm models don't have probabilities
+  if (class(model)[1] == 'LiblineaR' && model$Type %in% c(2, 5)) {
+    return(predict(model, as.matrix(test_X), proba = F)$predictions)
+  }
+  if (class(model)[1] == 'svm.formula') {
+    return(predict(model, as.matrix(test_X), proba = F))
+  }
+  
+  # get probabilities for other models
+  probs <- get_probs(model, test_X)
+  
+  preds <- probs > threshold
+  return(preds)
+}
+
+# Evaluation
+# evaluate model by creating confusion matrix on testing data
+# model: model object (glm or LibllineaR) type
+# test_X: Test Data (X)
+# test_y: Test Data (y)
+# threshold: threshold value for prediction (default = 0.5)
+cfmat_eval <- function(test_X, test_y, predict_y) {
+  cfmat <- table(actual = test_y[, 1], predicted = predict_y)
+  
+  tp <- cfmat[2, 2]
+  tn <- cfmat[1, 1]
+  fn <- cfmat[2, 1]
+  fp <- cfmat[1, 2]
+  
+  accuracy <- (tp + tn)/sum(cfmat)
+  precision <- tp/(tp+fp)
+  recall <- tp/(tp + fn)
+  f1_measure <- 1/mean(c(1/precision, 1/recall))
+  
+  sensitivity <- tp/(tp + fn)
+  specificity <- tn/(fp + tn)
+  
+  return(list('cfmat' = cfmat, 'accuracy' = accuracy, 'precision' = precision, 'recall' = recall, 'f1_measure' = f1_measure, 'sensitivity' = sensitivity, 'specificity' = specificity))
+}
+
+roc_eval <- function(model, test_X, test_y, print_plot = TRUE) {
+  roc_obj <- roc(response = as.numeric(test_y[, 1]), predictor = get_probs(model, test_X))
+  best_threshold <- coords(roc_obj, 'best', ret = c('threshold'), best.method = 'closest.topleft')
+  auc_value <- auc(roc_obj)
+  
+  if (print_plot){
+    plot(roc_obj)
+    print('best threshold')
+    print(best_threshold)
+    print('auc:')
+    print(auc_value)
+  }
+  
+  # print(coords(roc_obj, 'best', ret = c('threshold', 'tp'), transpose = FALSE))
+  
+  return(list('auc_value' = auc_value, 'best_threshold' = best_threshold[1, 1]))
+}
+
+# create ada boost
+bestK_adaB <- function(train_X, train_y, test_X, test_y, kmin, kmax) {
+  accuracy_rate <- c()
+  for (i in kmin: kmax) {
+    set.seed(23)
+    data_adaBoost <- cbind(train_y, train_X)
+    data_adaBoost$y <- factor(data_adaBoost$y)
+    
+    adaB <- boosting(y~., data = data_adaBoost, mfinal = i)
+    
+    cfmat <- table(actual = test_y[, 1], predicted = predict(adaB, data.frame(test_X))$class)
+    tp <- cfmat[2, 2]
+    tn <- cfmat[1, 1]
+    fn <- cfmat[2, 1]
+    fp <- cfmat[1, 2]
+    
+    accuracy <- (tp + tn)/sum(tp + tn + fn + fp)
+    accuracy_rate <- c(accuracy_rate, accuracy)
+    
+    cat("Processing the case with ", i , "trees. \n")
+  }
+  
+  acc = data.frame(k=kmin:kmax, accuracy_rate = accuracy_rate)
+  return(acc)
+}
+```
+
+Load data and preprocess
+```{r}
+Z <- read.csv('data/classification/heart.csv')
+Z <- na.omit(Z)
+Z <- encode_to_numeric(Z)
+
+# remove some variables
+# variable_names <- c('X', 'id', 'Gender', 'Online.boarding', 'Departure.Arrival.time.convenient', 'On.board.service', 'Gate.location', 'Customer.Type', 'Age', 'Type.of.Travel')
+# 
+# variable_names <- c('X', 'id')
+# 
+# Z <- Z[, !(colnames(Z) %in% variable_names)]
+
+y_name <- 'HeartDisease'
+y_idx <- which(colnames(Z) == y_name)
+colnames(Z)[which(colnames(Z) == y_name)] <- 'y'
+
+# drop = F for preserving data frame type
+y <- Z[, y_idx, drop = F]
+X <- Z[, -y_idx]
+
+# fix seed value for reproducibility 
+set.seed(300)
+# split data into training and test set 
+dat <- split_data(X, y)
+train_X <- dat$train_X
+train_y <- dat$train_y
+test_X <- dat$test_X
+test_y <- dat$test_y
+```
+
+Logistic Regresssion
+```{r}
+log_model <- glm(y~., family = binomial, data = cbind(train_X, train_y))
+summary(log_model)
+```
+
+
+Perform Model Selection
+```{r}
+selected_log <- best_subset_aic(train_X, train_y)
+```
+
+```{r}
+best_subset_bic(train_X, train_y)
+```
+
+```{r}
+forward_aic(train_X, train_y)
+```
+
+```{r}
+backward_aic(train_X, train_y)
+```
+
+```{r}
+stepwise_aic(train_X, train_y)
+```
+
+Check fit of Logistic Regression - HL Test
+```{r}
+lr_fit(selected_log)
+```
+
+Evaluate Logistic Regression Model with Confusion Matrix and roc curve
+```{r}
+lr_eval <- roc_eval(selected_log, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(selected_log, test_X, lr_eval$best_threshold))
+```
+
+Regularized Logistic Regression
+```{r}
+lr1 <- LiblineaR(train_X, train_y, type = 6)
+lr2 <- LiblineaR(train_X, train_y, type = 7)
+```
+
+Regularized Logistic Regression Evaluation
+```{r}
+lr1_eval <- roc_eval(lr1, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(lr1, test_X, lr1_eval$best_threshold))
+```
+
+```{r}
+lr2_eval <- roc_eval(lr2, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(lr2, test_X, lr2_eval$best_threshold))
+```
+
+SVM
+```{r}
+lr_svm_l1 <- LiblineaR(train_X, train_y, type = 5)
+lr_svm_l2 <- LiblineaR(train_X, train_y, type = 2)
+
+e1071_svm <- svm(factor(y)~., data = cbind(train_X, train_y), kernel = 'linear', type = 'C-classification')
+```
+
+SVM Evaluation
+```{r}
+cfmat_eval(test_X, test_y, get_preds(lr_svm_l1, test_X))
+```
+
+```{r}
+cfmat_eval(test_X, test_y, get_preds(lr_svm_l2, test_X))
+```
+
+```{r}
+cfmat_eval(test_X, test_y, get_preds(e1071_svm, test_X))
+```
+
+Decision Tree
+```{r}
+dtree <- rpart(factor(y)~., data = cbind(train_X, train_y), method = 'class')
+rpart.plot(dtree)
+dtree_eval <- roc_eval(dtree, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(dtree, test_X, dtree_eval$best_threshold))
+```
+
+Bagging
+```{r}
+bg <- bagging(factor(y)~., data = cbind(train_X, train_y))
+bg
+bg_eval <- roc_eval(bg, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(bg, test_X, bg_eval$best_threshold))
+```
+
+Random Forest
+```{r}
+rforest <- randomForest(factor(y)~., data = cbind(train_X, train_y))
+rforest_eval <- roc_eval(rforest, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(rforest, test_X, rforest_eval$best_threshold))
+```
+
+Ada Boost
+```{r}
+acc_adaB <- bestK_adaB(train_X, train_y, test_X, test_y, 1, 30)
+best_k <- acc_adaB$k[which.max(acc_adaB$accuracy_rate)]
+plot(acc_adaB$k, acc_adaB$accuracy_rate, type = 'o', ylim = c(0, 1), xlab = 'k', ylab = 'Accuracy rate', col = 'blue')
+
+data_adaboost <- cbind(train_X, train_y)
+data_adaboost$y <- factor(data_adaboost$y)
+adaB <- boosting(y~., data = data_adaboost, mfinal = best_k)
+barplot(adaB$importance)
+adaB_eval <- roc_eval(adaB, test_X, test_y)
+cfmat_eval(test_X, test_y, get_preds(adaB, test_X, adaB_eval$best_threshold))
+```
+
+Aggregate Voting
+```{r}
+# Regularized Logistic Model, SVM, Random Forest, Boosting
+pred_rf <- get_preds(rforest, test_X, rforest_eval$best_threshold)
+pred_rlr <- get_preds(lr1, test_X, lr2_eval$best_threshold)
+pred_svm <- get_preds(lr_svm_l1, test_X)
+pred_adaB <- get_preds(adaB, test_X, adaB_eval$best_threshold)
+pred_dtree <- get_preds(dtree, test_X, dtree_eval$best_threshold)
+pred_aggregate <- cbind(pred_rf, pred_rlr, pred_svm, pred_adaB, pred_dtree)
+
+prob_rf <- get_probs(rforest, test_X)
+prob_rlr <- get_probs(lr1, test_X)
+prob_adaB <- get_probs(adaB, test_X)
+prob_dtree <- get_probs(dtree, test_X)
+prob_aggregate <- cbind(prob_rf, prob_rlr, prob_adaB, prob_dtree)
+
+# Hard Voting (Majority Wins)
+get_majority <- function(row) {
+  one_voters <- length(which(row == 1))
+  if (one_voters > length(row) / 2) {
+    return(1)
+  }
+  return(0)
+}
+pred_majority <- apply(pred_aggregate, 1, get_majority)
+cfmat_eval(test_X, test_y, pred_majority)
+
+# Average Probabilities
+avg_probs <- apply(prob_aggregate, 1, mean)
+preds_avg <- avg_probs > 0.5
+cfmat_eval(test_X, test_y, preds_avg)
+
+# Weighted Probabilities
+weights <- c(0.4, 0.2, 0.3, 0.1)
+get_weighted_pred <- function(row) {
+  weighted_avg <- sum(row * weights)
+  return(weighted_avg > 0.5)
+}
+preds_weighted <- apply(prob_aggregate, 1, get_weighted_pred)
+cfmat_eval(test_X, test_y, preds_weighted)
+```
+
+```{r}
+B = 1000
+set.seed(300)
+
+model_names <- c('L1-Logistic Model', 'SVM', 'Decision Tree', 'Bagging', 'Random Forest', 'AdaBoost')
+accuracies <- data.frame(matrix(0, B, length(model_names)))
+colnames(accuracies) <- model_names
+
+model_names <- c('L1-Logistic Model', 'SVM', 'Decision Tree', 'Bagging', 'Random Forest', 'AdaBoost')
+aucs <- data.frame(matrix(0, B, length(model_names)))
+colnames(aucs) <- model_names
+
+model_names <- c('L1-Logistic Model', 'SVM', 'Decision Tree', 'Bagging', 'Random Forest', 'AdaBoost')
+sensitivities <- data.frame(matrix(0, B, length(model_names)))
+colnames(sensitivities) <- model_names
+
+model_names <- c('L1-Logistic Model', 'SVM', 'Decision Tree', 'Bagging', 'Random Forest', 'AdaBoost')
+specificities <- data.frame(matrix(0, B, length(model_names)))
+colnames(specificities) <- model_names
+
+
+for (i in 1:B) {
+  dat <- split_data(X, y)
+  train_X <- dat$train_X
+  train_y <- dat$train_y
+  test_X <- dat$test_X
+  test_y <- dat$test_y
+
+  # L2-Logistic Model
+  lr1 <- LiblineaR(train_X, train_y, type = 6)
+  lr1_eval <- roc_eval(lr2, test_X, test_y, print_plot = F)
+  rlr_cfmat <- cfmat_eval(test_X, test_y, get_preds(lr1, test_X, lr1_eval$best_threshold))
+  accuracies[i, 1] <- rlr_cfmat$accuracy
+  aucs[i, 1] <- lr1_eval$auc_value
+  sensitivities[i, 1] <- rlr_cfmat$sensitivity
+  specificities[i, 1] <- rlr_cfmat$specificity
+
+  # svm
+  lr_svm <- LiblineaR(train_X, train_y, type = 5)
+  svm_cfmat <- cfmat_eval(test_X, test_y, get_preds(lr_svm, test_X))
+  accuracies[i, 2] <- svm_cfmat$accuracy
+  sensitivities[i, 2] <- svm_cfmat$sensitivity
+  specificities[i, 2] <- svm_cfmat$specificity
+
+  # Decision Tree
+  dtree <- rpart(factor(y)~., data = cbind(train_X, train_y), method = 'class')
+  dtree_eval <- roc_eval(dtree, test_X, test_y, print_plot = F)
+  dtree_cfmat <- cfmat_eval(test_X, test_y, get_preds(dtree, test_X, dtree_eval$best_threshold))
+  accuracies[i, 3] <- dtree_cfmat$accuracy
+  aucs[i, 3] <- dtree_eval$auc_value
+  sensitivities[i, 3] <- dtree_cfmat$sensitivity
+  specificities[i, 3] <- dtree_cfmat$specificity
+
+  # bagging
+  bg <- bagging(factor(y)~., data = cbind(train_X, train_y))
+  bg_eval <- roc_eval(bg, test_X, test_y, print_plot = F)
+  bg_cfmat <- cfmat_eval(test_X, test_y, get_preds(bg, test_X, bg_eval$best_threshold))
+  accuracies[i, 4] <- bg_cfmat$accuracy
+  aucs[i, 4] <- bg_eval$auc_value
+  sensitivities[i, 4] <- bg_cfmat$sensitivity
+  specificities[i, 4] <- bg_cfmat$specificity
+
+  # Random Forest
+  rforest <- randomForest(factor(y)~., data = cbind(train_X, train_y))
+  rforest_eval <- roc_eval(rforest, test_X, test_y, print_plot = F)
+  rforest_cfmat <- cfmat_eval(test_X, test_y, get_preds(rforest, test_X, rforest_eval$best_threshold))
+  accuracies[i, 5] <- rforest_cfmat$accuracy
+  aucs[i, 5] <- rforest_eval$auc_value
+  sensitivities[i, 5] <- rforest_cfmat$sensitivity
+  specificities[i, 5] <- rforest_cfmat$specificity
+
+  # Ada boost
+  # acc_adaB <- bestK_adaB(train_X, train_y, test_X, test_y, 1, 30)
+  # best_k <- acc_adaB$k[which.max(acc_adaB$accuracy_rate)]
+
+  data_adaboost <- cbind(train_X, train_y)
+  data_adaboost$y <- factor(data_adaboost$y)
+  adaB <- boosting(y~., data = data_adaboost, mfinal = 30)
+  adaB_eval <- roc_eval(adaB, test_X, test_y, print_plot = F)
+  adaB_cfmat <- cfmat_eval(test_X, test_y, get_preds(adaB, test_X, adaB_eval$best_threshold))
+  accuracies[i, 6] <- adaB_cfmat$accuracy
+  aucs[i, 6] <- adaB_eval$auc_value
+  sensitivities[i, 6] <- adaB_cfmat$sensitivity
+  specificities[i, 6] <- adaB_cfmat$specificity
+
+  cat('Finished iteration: ', i)
+}
+
+# average_metrics <- apply(metrics, 2, mean)
+# average_metrics
+```
+
+```{r}
+summary(accuracies)
+summary(sensitivities)
+summary(specificities)
+```
+
+
+
+
